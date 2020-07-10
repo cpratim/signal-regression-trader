@@ -48,18 +48,22 @@ def until_close(now):
     y, m, d = [int(s) for s in str(now)[:10].split('-')]
     return((datetime(y, m, d, 16, 0, 0) - now).seconds)
 
+def minutes_from_open(now):
+    y, m, d = [int(s) for s in str(now)[:10].split('-')]
+    mo = datetime(y, m, d, 9, 30)
+    return floor((now - mo).seconds/60)
 
 class AlgoBot(object):
 
-    def __init__(self, symbols, funds=5000, margin=.005, freq=20, wait=True,
-                sleeptime=10, stop_loss=.01, take_profit=.02, sandbox=True):
+    def __init__(self, symbols, funds=10000, margin=.005, freq=20, wait=True,
+                sleeptime=10, stop_loss=.015, take_profit=.02, sandbox=True):
 
         print('Starting Model Training')
 
         self.base = 'https://paper-api.alpaca.markets' if sandbox is True else 'https://api.alpaca.markets'
         self.data_url = 'https://data.alpaca.markets'
         self.client = alpaca.REST(KEY, SECRET, self.base)
-        self.polygon = PolygonRest(KEY_LIVE)
+        self.polygon = PolygonRest(KEY)
         self.sigres = SignalRegression()
         self.symbols = symbols
         self.margin = margin
@@ -67,17 +71,12 @@ class AlgoBot(object):
         self.take_profit = take_profit
         self.calb = .002
         self.stop_loss = stop_loss
+        self.finished = []
         self.alloc = funds/len(symbols)
-        self.alert = '({}) [+] {} {} shares of {} at {} per share \n'
+        self.alert = '({}) [+] {} of {} shares of {} at {} per share \n'
         self.sleeptime = sleeptime
         self.active, self.models, self.barsets, self.funds, self.profits = [{} for i in range(5)]
         for sym in self.symbols:
-            bars = self.client.get_barset(
-                    symbols=self.symbols, 
-                    timeframe='minute', 
-                    limit=self.freq)
-            _bars = [[b.v, b.o, b.c, b.h, b.l] for b in bars[sym]]
-            self.barsets[sym] = _bars
             self.funds[sym] = funds/(len(self.symbols))
             print(f'Training Model for [{sym}]')
             model = self.sigres.generate_model(sym, self.freq, self.margin)
@@ -85,14 +84,21 @@ class AlgoBot(object):
         print('All Models Generated \n')
         if wait is True:
             self._wait()
+        bars = self.client.get_barset(
+                symbols=self.symbols, 
+                timeframe='minute', 
+                limit=self.freq)
+        for sym in self.symbols:
+            _bars = [[b.v, b.o, b.c, b.h, b.l] for b in bars[sym]]
+            self.barsets[sym] = _bars
 
-    def _updates(self):
-
+    def start(self):
+ 
         conn = alpaca.StreamConn(
             KEY, SECRET, 
             base_url=self.base,
             data_url=self.data_url,
-            data_stream='alpacadatav1'    
+            data_stream='polygon'    
         )
 
         @conn.on(r'^trade_updates$')
@@ -100,112 +106,103 @@ class AlgoBot(object):
             try:
                 order = data.order
                 sym, qty, side, fill_price = (order['symbol'], 
-                                                int(order['filled_qty']), 
-                                                order['side'],
-                                                order['filled_avg_price'])
+                                            int(order['filled_qty']), 
+                                            order['side'],
+                                            order['filled_avg_price'])
                 type_ = data.event
                 if type_ == 'fill':
+                    act = self.active[sym]
+                    _id, type_, limit = act['id'], act['type'], act['limit']
                     if side == 'buy':
-                        print(self.alert.format(timestamp(), 
-                                                'Bought', qty,
-                                                sym, fill_price,))
-                        self.funds[sym] -= qty * float(fill_price)
-                        self.active[sym] = {'type': 'sell',
-                                            'qty': qty,}
+                        if type_ == 'long':
+                            print(self.alert.format(timestamp(), 
+                                        'Longed', qty,
+                                        sym, fill_price,))
+                            self.funds[sym] -= qty * float(fill_price)
+                        elif type_ == 'short':
+                            print(self.alert.format(timestamp(), 
+                                        'Executed Short', qty,
+                                        sym, fill_price,))
+                            self.funds[sym] -= qty * float(fill_price)
+                            del self.active[sym]
                     elif side == 'sell':
-                        print(self.alert.format(timestamp(), 
-                                                'Sold', qty,
-                                                sym, fill_price,))
-                        self.funds[sym] += qty * float(fill_price)
-                        del self.active[sym]
+                        if type_ == 'long':
+                            print(self.alert.format(timestamp(), 
+                                        'Executed Long', qty,
+                                        sym, fill_price,))
+                            self.funds[sym] += qty * float(fill_price)
+                            del self.active[sym]
+                        elif type_ == 'short':
+                            print(self.alert.format(timestamp(), 
+                                        'Shorted', qty,
+                                        sym, fill_price,))
+                            self.funds[sym] += qty * float(fill_price)
+
             except Exception as error:
                 self._log(error)
 
-        @conn.on(r'^AM$')
+        @conn.on(r'^AM$')  
         async def on_minute_bars(conn, channel, _bar):
             sym = _bar.symbol
             bar = self._handle(_bar)
-            self.barsets[sym].pop(0)
             self.barsets[sym].append(bar)
-            bars = self.barsets[sym]
-            sig, hp, lp = self.models[sym].predict(bars)
-            high_prediction, low_prediction = hp * (1 - self.calb), lp * (1 + self.calb)
-            latest_price = self.polygon.get_last_price(sym)
-            if sym in self.active:
-                    act = self.active[sym]
-                    _id, type_, qty, limit = act['id'], act['type'], act['qty'], act['limit']
-                    if type_ == 'buy' and self._fill(_id) is None:
-                            if sig == 1:
-                                if low_prediction != limit:
-                                    self.client.cancel_order(_id)
-                                    qty = floor(self.funds[sym]/latest_price)
-                                    self._buy(sym, qty, low_prediction)
-                            else:
-                                self.client.cancel_order(_id)
-                                del self.active[sym]
-            else:
-                if sig == 1:
-                    qty = floor(self.funds[sym]/latest_price)
-                    self._buy(sym, qty, low_prediction)
-
-        streams = ['trade_updates']
-        conn.run(streams)
-        self._updates()
-
-    def _handle(self, bars):
-        return (bar.volume, bar.open,
-                bar.close, bar.high,
-                bar.low)
-
-    def start(self):
-
-        
-        Thread(target=self._barset_updater).start()
-        for sym in self.symbols:
-            Thread(target=self._ticker, args=(sym,)).start()
-        self._updates()
-
-    def _ticker(self, sym):
-
-        while until_close(now()) > 60:
-            try:
+            if len(self.barsets[sym]) >= self.freq:
+                self.barsets[sym].pop(0)
                 bars = self.barsets[sym]
-                sig, hp, lp = self.models[sym].predict(bars)
+                minute = minutes_from_open(now())
+                sig, hp, lp = self.models[sym].predict(bars, minute)
                 high_prediction, low_prediction = hp * (1 - self.calb), lp * (1 + self.calb)
                 latest_price = self.polygon.get_last_price(sym)
                 if sym in self.active:
-                        act = self.active[sym]
-                        type_, qty, limit = act['type'], act['qty'], act['limit']
-                        if type_ == 'buy' and self._fill(_id) is None:
-                                if sig == 1:
-                                    if low_prediction != limit:
-                                        self.client.cancel_order(_id)
-                                        qty = floor(self.funds[sym]/latest_price)
-                                        self._buy(sym, qty, low_prediction)
-                                else:
+                    act = self.active[sym]
+                    _id, type_, limit = act['id'], act['type'], act['limit']
+                    if self._fill(_id) is None:
+                        if type_ == 'long':
+                            qty = floor(self.funds[sym]/latest_price)
+                            if sig == 1:
+                                if low_prediction != limit:
                                     self.client.cancel_order(_id)
-                                    del self.active[sym]
+                                    self._buy(sym, qty, low_prediction)
+                            elif sig == -1:
+                                self.client.cancel_order(_id)
+                                sleep(1)
+                                self._sell(sym, qty, high_prediction)
+
+                        elif type_ == 'short':
+                            qty = floor(self.funds[sym]/latest_price)
+                            if sig == -1:
+                                if high_prediction != limit:
+                                    self.client.cancel_order(_id)
+                                    self._sell(sym, qty, high_prediction)
+                            elif sig == 1:
+                                self.client.cancel_order(_id)
+                                sleep(1)
+                                self._buy(sym, qty, low_prediction)
+                        if sig == 0:
+                            self.client.cancel_order(_id)
+                            del self.active[sym]
                 else:
-                    if sig == 1:
+                    if (self.funds[sym] - self.alloc)/self.alloc >= self.take_profit:
+                        self.finished.append(sym)
+                    if sym not in self.finished:
                         qty = floor(self.funds[sym]/latest_price)
-                        self._buy(sym, qty, low_prediction)
-                
-            except Exception as error:
-                self._log(error)
-            sleep(30)
-        return 
+                        if sig == 1:
+                            self._buy(sym, qty, low_prediction)
+                        else:
+                            self._sell(sym, qty, high_prediction)
 
-    def _barset_updater(self):
-        while until_close(now()) > 60:
-            bars = self.client.get_barset(
-                    symbols=self.symbols, 
-                    timeframe='minute', 
-                    limit=self.freq)
-            for sym in self.barsets:
-                _bars = [[b.v, b.o, b.c, b.h, b.l] for b in bars[sym]]
-                self.barsets[sym] = _bars
-            sleep(60)
+        streams = ['trade_updates'] + [f'AM.{sym}' for sym in self.symbols]
+        try:
+            conn.run(streams)
+        except Exception as error:
+            self._log(error)
+            self.start()
+      
 
+    def _handle(self, bar):
+        return (bar.volume, bar.open,
+                bar.close, bar.high,
+                bar.low)
         
     def _log(self, error):
 
@@ -225,9 +222,8 @@ class AlgoBot(object):
                                 stop_loss={'stop_price': stop_loss},
                                 take_profit={'limit_price': goal}
                                 )
-            self.active[sym] = {'type': 'buy',
+            self.active[sym] = {'type': 'long',
                                 'id': order.id,
-                                'qty': qty,
                                 'limit': price}
         except Exception as error:
             self._log(error)
@@ -236,16 +232,24 @@ class AlgoBot(object):
 
     def _sell(self, sym, qty, price):
         try:
+            stop_loss = price * (1 + self.stop_loss)
+            goal = price * (1 - self.margin)
             order = self.client.submit_order(
                                 symbol=sym, side='sell', 
                                 type='limit', limit_price=price, 
-                                qty=qty, time_in_force='day',)
-            self.active[sym]['type'] = 'sell'
-            self.active[sym]['id'] = order.id
-            return 
+                                qty=qty, time_in_force='day',
+                                order_class='bracket',
+                                stop_loss={'stop_price': stop_loss},
+                                take_profit={'limit_price': goal}
+                                )
+            self.active[sym] = {'type': 'short',
+                                'id': order.id,
+                                'qty': qty,
+                                'limit': price}
         except Exception as error:
             self._log(error)
-            return price
+            return None
+        return price
    
 
     def _fill(self, _id):
@@ -253,11 +257,10 @@ class AlgoBot(object):
         return float(fill_price) if fill_price is not None else None
 
     def _canceled(self, _id):
-
         return self.client.get_order(_id).status == 'canceled'
 
     def _wait(self):
-        time = until_open(20)
+        time = until_open(self.freq)
         print(f'Sleeping {time} seconds until Market Open')
         sleep(time)
         print(f'Starting Bot at {now()} \n')
@@ -289,6 +292,6 @@ class AlgoBot(object):
         return orders 
 
 
-symbols = ['NCLH', 'PLAY', 'PENN', 'ERI']
-ab = AlgoBot(symbols=symbols, wait=False)
+symbols = ['NCLH', 'MRO', 'SAVE', 'ERI']
+ab = AlgoBot(symbols=symbols, wait=True)
 ab.start()

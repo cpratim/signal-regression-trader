@@ -63,110 +63,66 @@ def unique(dump):
 
 #vochl
 
-def backtest_model(min_, freq, stop_loss, model):
+def backtest_model(min_, freq, thresh, stop_loss, model, short=True):
     shares, waiting, profit, pos, type_ = [0 for i in range(5)]
     funds = 1000
     last_freq = min_[:freq]
     last_buy = 0
-    last_low_goal = 0
-    last_high_goal = 0
-    last_low_perc, last_high_perc = 0, 0
-    waiting = 1
+    minute = freq
     for m in min_[freq:]:
         v, price, c, high, low = m
-        sig, high_goal, low_goal = model.predict(last_freq)
-        high_perc, low_perc = (high_goal - price)/price, (price - low_goal)/price
-        last_low_goal = low_goal
-        last_high_goal = high_goal
+        sig, hg, lg = model.predict(last_freq, minute)
+        high_goal, low_goal = hg * .998, lg * 1.002
         if type_ == 0:
             if profit/funds * 100 > 2:
-                break
-        if low <= last_low_goal * 1.002 and type_ == 0 and sig == 1:
-            type_ = 1
-            shares = floor(funds/price)
-            last_buy = last_low_goal
-            print(f'Bought {shares} shares at {last_low_goal} per share')
+               # break
+               pass
         if type_ == 1:
-            goal = (last_buy * 1.005)
+            goal = (last_buy * (1 + thresh))
             sl = last_buy * (1 - stop_loss)
             if high >= goal:
                 p = shares * (goal - last_buy)
-                print(f'Executed {shares} shares at {goal} per share')
+                print(f'[{minute}] Executed {shares} shares at {goal} per share')
                 profit += p
                 funds += p
                 type_ = 0
-            elif low <= last_buy * (1 - stop_loss):
-                p = shares * (sl - last_buy)
-                print(f'Executed {shares} shares at {sl} per share')
-                profit += p
-                funds += p
-                type_ = 0
-
-        last_freq.pop(0)
-        last_freq.append(m)
-    last_close = min_[-1][2]
-    if type_ == 1: profit += shares * (last_close - last_buy)
-    return profit/funds * 100
-
-def backtest_model_2(min_, freq, stop_loss, model, raw=False):
-    shares, waiting, profit, pos, type_ = [0 for i in range(5)]
-    funds = 1000
-    last_freq = min_[:freq]
-    last_buy = 0
-    last_low_goal = 0
-    last_high_goal = 0
-    last_low_perc, last_high_perc = 0, 0
-    waiting = 0
-    for m in min_[freq:]:
-        v, price, c, high, low = m
-        signal, high_goal, low_goal = model.predict(last_freq)
-        if signal == 1 and type_ == 0 and waiting == 0:
-            last_high_goal = high_goal
-            shares = floor(funds/price)
-            type_ = 1
-            waiting = 1
-            last_buy = price
-            print(f'Bought {shares} shares at {price} per share')
-        elif signal == -2 and type_ == 0 and waiting == 0:
-            last_low_goal = low_goal
-            shares = floor(funds/price)
-            type_ = -1
-            waiting = 1
-            last_buy = price
-            print(f'Shorted {shares} shares at {price} per share')
-        if type_ == 1:
-            sl = last_buy * (1 - stop_loss)
-            goal = last_high_goal * .998
-            if high >= goal:
-                p = shares * (goal - last_buy)
-                print(f'Executed Long {shares} shares at {goal} per share')
-                profit += p
-                funds += p
-                type_ = 0
-                waiting = 0
             elif low <= sl:
                 p = shares * (sl - last_buy)
-                print(f'Executed Long {shares} shares at {sl} per share')
+                print(f'[{minute}] Executed {shares} shares at {sl} per share')
                 profit += p
                 funds += p
                 type_ = 0
-                waiting = 0
-            else:
-                waiting += 1
-        if waiting == freq:
-            p = shares * (price - last_buy)
-            print(f'Executed Long {shares} shares at {sl} per share')
-            profit += p
-            funds += p
-            type_ = 0
-            waiting = 0
-
+        elif type_ == -1:
+            goal = (last_buy * (1 - thresh))
+            sl = last_buy * (1 + stop_loss)
+            if high >= goal:
+                p = shares * (last_buy - goal)
+                print(f'[{minute}] Executed {shares} shares at {goal} per share')
+                profit += p
+                funds += p
+                type_ = 0
+            elif low <= sl:
+                p = shares * (last_buy - sl)
+                print(f'[{minute}] Executed {shares} shares at {sl} per share')
+                profit += p
+                funds += p
+                type_ = 0
+        #print(sig, low_goal, high_goal, price, low, high)
+        if low <= low_goal and type_ == 0 and sig == 1:
+            type_ = 1
+            shares = floor(funds/price)
+            last_buy = low_goal
+            print(f'[{minute}] Bought {shares} shares at {last_buy} per share')
+        elif high >= high_goal and type_ == 0 and sig == -1 and short is True:
+            type_ = -1
+            shares = floor(funds/price)
+            last_buy = high_goal
+            print(f'[{minute}] Shorted {shares} shares at {last_buy} per share')
+        minute += 1
         last_freq.pop(0)
         last_freq.append(m)
     last_close = min_[-1][2]
     if type_ == 1: profit += shares * (last_close - last_buy)
-    if raw is True:
-        return profit
     return profit/funds * 100
 
 
@@ -182,4 +138,5 @@ for s in sym:
         symbols.append(s)
 
 print(sym)
+
 '''

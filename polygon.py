@@ -206,5 +206,6 @@ class PolygonRest(object):
 '''
 poly = PolygonRest(KEY_LIVE)
 print(poly.get_last_price('AAPL'))
-poly.get_bars(start='2020-07-06')
+poly.get_bars(start='2020-07-09')
+
 '''
